@@ -1,0 +1,189 @@
+#Score: 0.91891
+#Public score: 0.91948
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+import lightgbm as lgb
+import gc
+
+print("="*90)
+print("🚀 CORRECT SUBMISSION - FIXED PATHS")
+print("="*90)
+
+# 1. ЗАГРУЖАЕМ ПРАВИЛЬНЫЕ ДАННЫЕ С КОРРЕКТНЫМИ ПУТЯМИ
+print("\n📥 Loading correct data...")
+
+# Тренировочные данные
+train_path = '/kaggle/input/competitions/whos-talking-classify-the-app-by-its-packets/train.csv'
+test_path = '/kaggle/input/competitions/whos-talking-classify-the-app-by-its-packets/test.csv'
+
+# Загружаем train (8.2M) с семплированием 30%
+print("Loading training data...")
+train_df = pd.read_csv(train_path, low_memory=False)
+train_df = train_df.sample(frac=0.3, random_state=42)  # 2.47M строк
+train_df['app_service'] = train_df['app_service'].astype(str)
+print(f"✅ Train shape: {train_df.shape}")
+
+# Загружаем test (4.7M) - полностью
+print("Loading test data...")
+test_df = pd.read_csv(test_path, low_memory=False)
+print(f"✅ Test shape: {test_df.shape}")  # Должно быть 4,730,370
+
+# 2. БЫСТРОЕ ИЗВЛЕЧЕНИЕ ПРИЗНАКОВ
+print("\n⚙️ Extracting features (vectorized)...")
+
+tcp_cols = [f'tcp_len_{i}' for i in range(1, 31)]
+
+def extract_features_vectorized(df):
+    """Быстрое извлечение признаков с numpy"""
+    packets = df[tcp_cols].values.astype(np.int16)
+    
+    features = {
+        'out_cnt': np.sum(packets > 0, axis=1),
+        'in_cnt': np.sum(packets < 0, axis=1),
+        'out_vol': np.sum(np.maximum(packets, 0), axis=1),
+        'in_vol': -np.sum(np.minimum(packets, 0), axis=1),
+        'mtu_out': np.sum(packets > 1200, axis=1),
+        'mtu_in': np.sum(packets < -1200, axis=1),
+        'max_out': np.max(np.where(packets > 0, packets, 0), axis=1),
+        'max_in': -np.min(np.where(packets < 0, packets, 0), axis=1),
+    }
+    
+    # Первые 10 пакетов
+    for i in range(10):
+        features[f'p{i+1}'] = packets[:, i]
+    
+    # Направления первых 3 пакетов
+    features['dir1'] = np.sign(packets[:, 0])
+    features['dir2'] = np.sign(packets[:, 1])
+    features['dir3'] = np.sign(packets[:, 2])
+    
+    # Смена направлений
+    directions = np.sign(packets)
+    features['dir_changes'] = np.sum(np.abs(np.diff(directions, axis=1)) > 0, axis=1)
+    
+    return pd.DataFrame(features, dtype=np.float32)
+
+# Извлекаем признаки
+print("Extracting train features...")
+X_train = extract_features_vectorized(train_df)
+y_train = train_df['app_service'].values
+
+print("Extracting test features...")
+X_test = extract_features_vectorized(test_df)
+
+print(f"✅ Train features: {X_train.shape}")
+print(f"✅ Test features: {X_test.shape}")
+print(f"✅ Memory usage: {X_train.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
+
+# 3. КОДИРУЕМ ЦЕЛИ
+print("\n🏷️ Encoding labels...")
+le = LabelEncoder()
+y_enc = le.fit_transform(y_train)
+print(f"✅ Classes: {len(le.classes_)}")
+
+# 4. ОБУЧАЕМ МОДЕЛЬ
+print("\n🚀 Training LightGBM...")
+
+params = {
+    'objective': 'multiclass',
+    'num_class': len(le.classes_),
+    'metric': 'multi_logloss',
+    'num_leaves': 63,
+    'learning_rate': 0.05,
+    'feature_fraction': 0.7,
+    'bagging_fraction': 0.7,
+    'bagging_freq': 5,
+    'min_child_samples': 20,
+    'reg_lambda': 1.0,
+    'reg_alpha': 0.5,
+    'verbose': -1,
+    'random_state': 42,
+    'n_jobs': -1
+}
+
+model = lgb.LGBMClassifier(**params)
+model.fit(X_train, y_enc)
+
+# 5. ПРЕДСКАЗАНИЯ (быстро)
+print("\n🎯 Making predictions...")
+test_pred = model.predict(X_test)
+test_pred_labels = le.inverse_transform(test_pred)
+
+# 6. СОЗДАЕМ САБМИТ
+print("\n📝 Creating submission...")
+submission = pd.DataFrame({
+    'id': test_df['id'],
+    'app_service': test_pred_labels
+})
+
+# Проверяем размер
+print(f"✅ Submission shape: {submission.shape}")
+print(f"✅ Expected: (4730370, 2)")
+
+if len(submission) == 4730370:
+    print("✅ Perfect! Correct number of rows!")
+else:
+    print(f"⚠️ Warning: Got {len(submission)} rows, expected 4730370")
+
+# Сохраняем
+submission.to_csv('submission_fixed.csv', index=False)
+
+print("="*90)
+print("✅ DONE!")
+print(f"Submission saved: submission_fixed.csv")
+print(f"Rows: {len(submission):,}")
+print(f"Classes predicted: {submission['app_service'].nunique()}")
+print("="*90)
+
+# Показываем распределение предсказаний
+print("\n📊 Top 10 predicted classes:")
+print(submission['app_service'].value_counts().head(10))
+==========================================================================================
+🚀 CORRECT SUBMISSION - FIXED PATHS
+==========================================================================================
+
+📥 Loading correct data...
+Loading training data...
+✅ Train shape: (2474564, 31)
+Loading test data...
+✅ Test shape: (4730370, 31)
+
+⚙️ Extracting features (vectorized)...
+Extracting train features...
+Extracting test features...
+✅ Train features: (2474564, 22)
+✅ Test features: (4730370, 22)
+✅ Memory usage: 0.20 GB
+
+🏷️ Encoding labels...
+✅ Classes: 252
+
+🚀 Training LightGBM...
+
+🎯 Making predictions...
+
+📝 Creating submission...
+✅ Submission shape: (4730370, 2)
+✅ Expected: (4730370, 2)
+✅ Perfect! Correct number of rows!
+==========================================================================================
+✅ DONE!
+Submission saved: submission_fixed.csv
+Rows: 4,730,370
+Classes predicted: 252
+==========================================================================================
+
+📊 Top 10 predicted classes:
+app_service
+343             107729
+bing            103003
+Apple           102966
+287             101780
+120             100925
+mail_ru         100028
+tria             99986
+Telegram         99922
+1                99885
+apple_icloud     99769
+Name: count, dtype: int64

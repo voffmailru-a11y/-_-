@@ -1,0 +1,393 @@
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+
+# Input data files are available in the read-only "../input/" directory
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+!kaggle competitions download -c dga-domain-detection-challenge
+
+# Теперь распакуем скачанный файл
+!unzip -q dga-domain-detection-challenge.zip -d /kaggle/working/
+
+# Проверим, что скачалось
+!ls -la /kaggle/working/
+
+# You can write up to 20GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All" 
+# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
+Downloading dga-domain-detection-challenge.zip to /kaggle/working
+100%|████████████████████████████████████████| 258M/258M [00:08<00:00, 31.3MB/s]
+
+total 770012
+drwxr-xr-x 2 root root      4096 Feb 22 11:58 .
+drwxr-xr-x 8 root root      4096 Feb 22 11:58 ..
+-rw-r--r-- 1 root root 270296844 Oct 13 21:18 dga-domain-detection-challenge.zip
+---------- 1 root root    104206 Feb 22 11:58 __notebook__.ipynb
+-rw-r--r-- 1 root root        66 Oct 13 21:17 sample_submission.csv
+-rw-r--r-- 1 root root 186548519 Oct 13 21:17 test.csv
+-rw-r--r-- 1 root root 331518539 Oct 13 21:17 train.csv
+# Проверяем доступность GPU
+import tensorflow as tf
+print("GPU Available:", tf.config.list_physical_devices('GPU'))
+
+# Оптимизируем загрузку данных - читаем чанками!
+import pandas as pd
+import numpy as np
+import re
+from tqdm import tqdm
+import gc
+
+# Функция для оптимизации типов данных (экономит память)
+def optimize_dtypes(df):
+    for col in df.columns:
+        if df[col].dtype == 'float64':
+            df[col] = df[col].astype('float32')
+        elif df[col].dtype == 'int64':
+            df[col] = df[col].astype('int32')
+    return df
+
+# Загружаем тренировочные данные чанками
+print("Загружаем тренировочные данные чанками...")
+train_chunks = pd.read_csv('/kaggle/working/train.csv', chunksize=500000)  # по 500к строк
+
+# Создаем пустой DataFrame для результатов
+feature_names = None
+processed_chunks = []
+
+# Обрабатываем каждый чанк
+for i, chunk in enumerate(tqdm(train_chunks)):
+    print(f"\nОбработка чанка {i+1}, размер: {len(chunk)}")
+    
+    # БЫСТРЫЙ парсинг через регулярные выражения (в 100 раз быстрее tldextract)
+    def fast_domain_parse(domain):
+        # Простое разбиение по точкам
+        parts = str(domain).split('.')
+        if len(parts) == 1:
+            return pd.Series(['', parts[0], ''])
+        elif len(parts) == 2:
+            return pd.Series(['', parts[0], parts[1]])
+        else:
+            return pd.Series(['.'.join(parts[:-2]), parts[-2], parts[-1]])
+    
+    # Применяем быстрый парсинг
+    parsed = chunk['domain'].apply(fast_domain_parse)
+    parsed.columns = ['subdomain', 'sld', 'tld']
+    
+    # Создаем признаки (только самые важные для начала)
+    chunk['sld'] = parsed['sld']
+    chunk['tld'] = parsed['tld']
+    
+    # SLD признаки
+    chunk['sld_length'] = chunk['sld'].str.len()
+    chunk['sld_entropy'] = chunk['sld'].apply(lambda x: len(set(x)) / (len(x) + 1))  # упрощенная энтропия
+    chunk['digit_count'] = chunk['sld'].str.count(r'\d')
+    chunk['digit_ratio'] = chunk['digit_count'] / (chunk['sld_length'] + 1)
+    chunk['has_digits'] = (chunk['digit_count'] > 0).astype('int8')
+    chunk['has_hyphen'] = chunk['sld'].str.contains('-').astype('int8')
+    chunk['vowel_count'] = chunk['sld'].str.count(r'[aeiouyAEIOUY]')
+    chunk['vowel_ratio'] = chunk['vowel_count'] / (chunk['sld_length'] + 1)
+    
+    # TLD признаки (бинарные)
+    suspicious_tlds = ['tk', 'ml', 'ga', 'cf', 'xyz', 'top', 'club', 'online', 'site']
+    chunk['suspicious_tld'] = chunk['tld'].isin(suspicious_tlds).astype('int8')
+    chunk['has_tld'] = (chunk['tld'] != '').astype('int8')
+    
+    # Оставляем только нужные колонки
+    feature_cols = ['sld_length', 'sld_entropy', 'digit_ratio', 'has_digits', 
+                    'has_hyphen', 'vowel_ratio', 'suspicious_tld', 'has_tld', 'label']
+    
+    result = chunk[feature_cols].copy()
+    
+    # Оптимизируем типы
+    result = optimize_dtypes(result)
+    
+    processed_chunks.append(result)
+    
+    # Очищаем память
+    del chunk, parsed
+    gc.collect()
+    
+    # Если тестовая память, сохраняем промежуточный результат
+    if i % 5 == 0 and i > 0:
+        print(f"Сохраняем промежуточный результат после чанка {i}...")
+        temp_df = pd.concat(processed_chunks, ignore_index=True)
+        temp_df.to_parquet(f'train_chunk_{i}.parquet')
+        processed_chunks = [temp_df]  # оставляем последний для продолжения
+        gc.collect()
+
+# Объединяем все чанки
+print("Объединяем результаты...")
+train_processed = pd.concat(processed_chunks, ignore_index=True)
+print(f"Итоговый размер: {train_processed.shape}")
+print(f"Использовано памяти: {train_processed.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
+
+# Сохраняем в эффективном формате
+train_processed.to_parquet('train_processed.parquet')
+2026-02-22 11:58:49.319827: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:467] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+E0000 00:00:1771761529.699854      24 cuda_dnn.cc:8579] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+E0000 00:00:1771761529.797453      24 cuda_blas.cc:1407] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+W0000 00:00:1771761530.705239      24 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+W0000 00:00:1771761530.705311      24 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+W0000 00:00:1771761530.705313      24 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+W0000 00:00:1771761530.705316      24 computation_placer.cc:177] computation placer already registered. Please check linkage and avoid linking the same target more than once.
+GPU Available: [PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')]
+Загружаем тренировочные данные чанками...
+0it [00:00, ?it/s]
+Обработка чанка 1, размер: 500000
+1it [00:38, 38.45s/it]
+Обработка чанка 2, размер: 500000
+2it [01:17, 39.05s/it]
+Обработка чанка 3, размер: 500000
+3it [01:57, 39.16s/it]
+Обработка чанка 4, размер: 500000
+4it [02:36, 39.18s/it]
+Обработка чанка 5, размер: 500000
+5it [03:15, 39.18s/it]
+Обработка чанка 6, размер: 500000
+Сохраняем промежуточный результат после чанка 5...
+6it [03:55, 39.52s/it]
+Обработка чанка 7, размер: 500000
+7it [04:35, 39.49s/it]
+Обработка чанка 8, размер: 500000
+8it [05:14, 39.39s/it]
+Обработка чанка 9, размер: 500000
+9it [05:53, 39.43s/it]
+Обработка чанка 10, размер: 500000
+10it [06:33, 39.40s/it]
+Обработка чанка 11, размер: 500000
+Сохраняем промежуточный результат после чанка 10...
+11it [07:13, 39.72s/it]
+Обработка чанка 12, размер: 500000
+12it [07:52, 39.59s/it]
+Обработка чанка 13, размер: 500000
+13it [08:32, 39.47s/it]
+Обработка чанка 14, размер: 500000
+14it [09:11, 39.41s/it]
+Обработка чанка 15, размер: 500000
+15it [09:50, 39.36s/it]
+Обработка чанка 16, размер: 500000
+Сохраняем промежуточный результат после чанка 15...
+16it [10:31, 39.87s/it]
+Обработка чанка 17, размер: 500000
+17it [11:10, 39.68s/it]
+Обработка чанка 18, размер: 500000
+18it [11:50, 39.53s/it]
+Обработка чанка 19, размер: 500000
+19it [12:29, 39.42s/it]
+Обработка чанка 20, размер: 500000
+20it [13:08, 39.33s/it]
+Обработка чанка 21, размер: 500000
+Сохраняем промежуточный результат после чанка 20...
+21it [13:49, 39.96s/it]
+Обработка чанка 22, размер: 500000
+22it [14:28, 39.70s/it]
+Обработка чанка 23, размер: 500000
+23it [15:08, 39.71s/it]
+Обработка чанка 24, размер: 500000
+24it [15:48, 39.61s/it]
+Обработка чанка 25, размер: 500000
+25it [16:27, 39.58s/it]
+Обработка чанка 26, размер: 500000
+Сохраняем промежуточный результат после чанка 25...
+26it [17:09, 40.27s/it]
+Обработка чанка 27, размер: 500000
+27it [17:48, 39.95s/it]
+Обработка чанка 28, размер: 500000
+28it [18:28, 39.79s/it]
+Обработка чанка 29, размер: 500000
+29it [19:07, 39.65s/it]
+Обработка чанка 30, размер: 500000
+30it [19:46, 39.54s/it]
+Обработка чанка 31, размер: 500000
+Сохраняем промежуточный результат после чанка 30...
+31it [20:28, 40.36s/it]
+Обработка чанка 32, размер: 500000
+32it [21:08, 40.06s/it]
+Обработка чанка 33, размер: 500000
+33it [21:47, 39.78s/it]
+Обработка чанка 34, размер: 500000
+34it [22:26, 39.64s/it]
+Обработка чанка 35, размер: 500000
+35it [23:06, 39.59s/it]
+Обработка чанка 36, размер: 219790
+Сохраняем промежуточный результат после чанка 35...
+36it [23:26, 39.08s/it]
+Объединяем результаты...
+Итоговый размер: (17719790, 9)
+Использовано памяти: 405.57 MB
+# Тестовые данные обрабатываем аналогично
+print("Обрабатываем тестовые данные...")
+test_chunks = pd.read_csv('/kaggle/working/test.csv', chunksize=500000)
+test_results = []
+
+for i, chunk in enumerate(tqdm(test_chunks)):
+    # Быстрый парсинг
+    parsed = chunk['domain'].apply(fast_domain_parse)
+    parsed.columns = ['subdomain', 'sld', 'tld']
+    
+    # Те же признаки
+    chunk['sld'] = parsed['sld']
+    chunk['tld'] = parsed['tld']
+    
+    chunk['sld_length'] = chunk['sld'].str.len()
+    chunk['sld_entropy'] = chunk['sld'].apply(lambda x: len(set(x)) / (len(x) + 1))
+    chunk['digit_count'] = chunk['sld'].str.count(r'\d')
+    chunk['digit_ratio'] = chunk['digit_count'] / (chunk['sld_length'] + 1)
+    chunk['has_digits'] = (chunk['digit_count'] > 0).astype('int8')
+    chunk['has_hyphen'] = chunk['sld'].str.contains('-').astype('int8')
+    chunk['vowel_count'] = chunk['sld'].str.count(r'[aeiouyAEIOUY]')
+    chunk['vowel_ratio'] = chunk['vowel_count'] / (chunk['sld_length'] + 1)
+    
+    suspicious_tlds = ['tk', 'ml', 'ga', 'cf', 'xyz', 'top', 'club', 'online', 'site']
+    chunk['suspicious_tld'] = chunk['tld'].isin(suspicious_tlds).astype('int8')
+    chunk['has_tld'] = (chunk['tld'] != '').astype('int8')
+    
+    # Для теста нет label
+    feature_cols = ['sld_length', 'sld_entropy', 'digit_ratio', 'has_digits', 
+                    'has_hyphen', 'vowel_ratio', 'suspicious_tld', 'has_tld']
+    
+    result = chunk[feature_cols].copy()
+    result = optimize_dtypes(result)
+    test_results.append(result)
+    
+    del chunk, parsed
+    gc.collect()
+
+test_processed = pd.concat(test_results, ignore_index=True)
+test_processed.to_parquet('test_processed.parquet')
+print(f"Тестовые данные обработаны: {test_processed.shape}")
+Обрабатываем тестовые данные...
+16it [09:56, 37.27s/it]
+Тестовые данные обработаны: (7594197, 8)
+import lightgbm as lgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import fbeta_score
+import gc
+
+# Загружаем обработанные данные
+train_processed = pd.read_parquet('train_processed.parquet')
+
+# Разделяем на признаки и целевую
+feature_cols = ['sld_length', 'sld_entropy', 'digit_ratio', 'has_digits', 
+                'has_hyphen', 'vowel_ratio', 'suspicious_tld', 'has_tld']
+
+X = train_processed[feature_cols]
+y = train_processed['label']
+
+# Разделяем на train/val
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, random_state=42, stratify=y)
+
+# Очищаем память
+del train_processed
+gc.collect()
+
+# Создаем LightGBM датасеты
+train_data = lgb.Dataset(X_train, label=y_train)
+val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+
+# Параметры для F0.5 оптимизации
+params = {
+    'objective': 'binary',
+    'metric': 'binary_logloss',
+    'boosting_type': 'gbdt',
+    'num_leaves': 63,
+    'learning_rate': 0.05,
+    'feature_fraction': 0.8,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 5,
+    'verbose': 0,
+    'num_threads': -1,
+    'scale_pos_weight': (y_train == 0).sum() / (y_train == 1).sum() * 0.5  # Учитываем F0.5
+}
+
+# Обучаем модель
+print("Обучение LightGBM...")
+model = lgb.train(
+    params,
+    train_data,
+    valid_sets=[val_data],
+    num_boost_round=500,
+    callbacks=[lgb.early_stopping(50), lgb.log_evaluation(50)]
+)
+
+# Предсказания
+y_pred_proba = model.predict(X_val)
+
+# Находим оптимальный порог
+from sklearn.metrics import precision_recall_curve
+
+precision, recall, thresholds = precision_recall_curve(y_val, y_pred_proba)
+
+best_f05 = 0
+best_thresh = 0.5
+beta = 0.5
+
+for i, thresh in enumerate(thresholds[:-1]):  # пропускаем последний
+    f05 = (1 + beta**2) * (precision[i] * recall[i]) / (beta**2 * precision[i] + recall[i] + 1e-10)
+    if f05 > best_f05:
+        best_f05 = f05
+        best_thresh = thresh
+
+print(f"\nЛучший порог: {best_thresh:.4f}")
+print(f"Лучший F0.5 на валидации: {best_f05:.4f}")
+Обучение LightGBM...
+Training until validation scores don't improve for 50 rounds
+[50]	valid_0's binary_logloss: 0.42777
+[100]	valid_0's binary_logloss: 0.402816
+[150]	valid_0's binary_logloss: 0.396914
+[200]	valid_0's binary_logloss: 0.394725
+[250]	valid_0's binary_logloss: 0.393732
+[300]	valid_0's binary_logloss: 0.392961
+[350]	valid_0's binary_logloss: 0.392635
+[400]	valid_0's binary_logloss: 0.39225
+[450]	valid_0's binary_logloss: 0.391959
+[500]	valid_0's binary_logloss: 0.391812
+Did not meet early stopping. Best iteration is:
+[500]	valid_0's binary_logloss: 0.391812
+
+Лучший порог: 0.5561
+Лучший F0.5 на валидации: 0.8359
+# Загружаем тестовые данные
+test_processed = pd.read_parquet('test_processed.parquet')
+
+# Делаем предсказания чанками (если тест большой)
+chunk_size = 100000
+predictions = []
+
+for i in range(0, len(test_processed), chunk_size):
+    chunk = test_processed.iloc[i:i+chunk_size]
+    pred_proba = model.predict(chunk)
+    pred = (pred_proba >= best_thresh).astype(int)
+    predictions.extend(pred)
+
+# Создаем сабмишен
+submission = pd.DataFrame({
+    'id': range(len(predictions)),
+    'label': predictions
+})
+
+submission.to_csv('submission.csv', index=False)
+print("Сабмишен сохранен!")
+print(submission.head())
+print(f"\nРаспределение: {submission['label'].value_counts(normalize=True)}")
+Сабмишен сохранен!
+   id  label
+0   0      0
+1   1      0
+2   2      0
+3   3      1
+4   4      0
+
+Распределение: label
+0    0.701467
+1    0.298533
+Name: proportion, dtype: float64
